@@ -1,0 +1,9 @@
+target/
+.git/
+.github/
+PLAN.md
+README.md
+CHANGELOG.md
+docker-compose.yml
+deny.toml
+rustfmt.toml

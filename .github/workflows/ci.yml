@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  RUST_BACKTRACE: short
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (mock feature)
+        run: cargo clippy --all-targets --features mock -- -D warnings
+      - name: Test (default features)
+        run: cargo test
+      - name: Test (plaintext build)
+        run: cargo test --no-default-features
+      - name: Build release (plaintext)
+        run: cargo build --release --no-default-features

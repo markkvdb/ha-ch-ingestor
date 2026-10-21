@@ -1,0 +1,84 @@
+[package]
+name = "ha-ch-ingestor"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Stream Home Assistant state changes into ClickHouse"
+license = "MIT"
+default-run = "ha-ch-ingestor"
+repository = "https://github.com/markkvdb/ha-ch-ingestor"
+exclude = ["/.github/*", "/PLAN.md"]
+
+[dependencies]
+tokio = { version = "1.54", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+    "net",
+] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+    "url",
+] }
+futures-util = { version = "0.3", default-features = false, features = [
+    "std",
+    "sink",
+] }
+reqwest = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = [
+    "fmt",
+    "env-filter",
+    "json",
+    "ansi",
+] }
+thiserror = "2"
+clap = { version = "4", default-features = false, features = [
+    "std",
+    "derive",
+    "help",
+    "usage",
+    "error-context",
+] }
+url = "2"
+fastrand = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[features]
+default = ["tls"]
+tls = [
+    "tokio-tungstenite/rustls-tls-native-roots",
+    "reqwest/rustls",
+]
+mock = []
+
+[[bin]]
+name = "mock_ha"
+required-features = ["mock"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+ref_option = "warn"
+semicolon_if_nothing_returned = "warn"
+unnecessary_semicolon = "warn"
+unused_trait_names = "warn"
+
+[lints]
+workspace = true

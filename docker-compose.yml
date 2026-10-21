@@ -1,0 +1,40 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.9-alpine
+    environment:
+      # The official image network-locks the `default` user unless a
+      # user/password is configured. Fine for local development.
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    ports:
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+
+  mock-ha:
+    build:
+      context: .
+      args:
+        BIN: mock_ha
+        FEATURES: mock
+    environment:
+      MOCK_HA_ADDR: 0.0.0.0:8124
+      MOCK_HA_INTERVAL_MS: "250"
+      RUST_LOG: info
+
+  ingestor:
+    build:
+      context: .
+    depends_on:
+      - clickhouse
+      - mock-ha
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      HA_WS_URL: ws://mock-ha:8124/api/websocket
+      HA_TOKEN: dev-token
+      BATCH_SIZE: "10"
+      FLUSH_INTERVAL: "2"
+      EXCLUDE_ENTITIES: sensor.mock_excluded
+      RUST_LOG: info
+
+volumes:
+  clickhouse-data:
