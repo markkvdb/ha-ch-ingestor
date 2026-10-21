@@ -7,6 +7,8 @@
 //! Home Assistant emits ISO-8601/RFC-3339 timestamps with an offset (usually
 //! `+00:00`); ClickHouse stores them in `DateTime64(6, 'UTC')` columns.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use time::format_description::FormatItem;
@@ -116,21 +118,36 @@ fn attributes_json(new_state: &Value, filters: &Filters) -> String {
     }
 }
 
+static WARNED_BAD_TIMESTAMP: AtomicBool = AtomicBool::new(false);
+
 /// Parse a Home Assistant timestamp and convert it to UTC.
 ///
 /// Accepts RFC-3339 (`2026-10-11T18:10:02.123456+02:00`, `...Z`) and, as a
-/// fallback, naive ISO-8601 which is assumed to be UTC.
+/// fallback, naive ISO-8601 which is assumed to be UTC. Python's
+/// `datetime.fromisoformat` also accepts a space between date and time, so a
+/// space is normalised to `T` before parsing.
 #[must_use]
 pub fn parse_ha_timestamp(raw: &str) -> Option<OffsetDateTime> {
-    if let Ok(timestamp) = OffsetDateTime::parse(raw, &Rfc3339) {
+    let normalized = (raw.as_bytes().get(10) == Some(&b' ')).then(|| raw.replacen(' ', "T", 1));
+    let candidate = normalized.as_deref().unwrap_or(raw);
+
+    if let Ok(timestamp) = OffsetDateTime::parse(candidate, &Rfc3339) {
         return Some(timestamp.to_offset(UtcOffset::UTC));
     }
-    if let Ok(timestamp) = PrimitiveDateTime::parse(raw, NAIVE_NO_FRACTION) {
+    if let Ok(timestamp) = PrimitiveDateTime::parse(candidate, NAIVE_NO_FRACTION) {
         return Some(timestamp.assume_utc());
     }
-    PrimitiveDateTime::parse(raw, NAIVE_FRACTION)
-        .ok()
-        .map(PrimitiveDateTime::assume_utc)
+    if let Ok(timestamp) = PrimitiveDateTime::parse(candidate, NAIVE_FRACTION) {
+        return Some(timestamp.assume_utc());
+    }
+
+    if !WARNED_BAD_TIMESTAMP.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            value = raw,
+            "cannot parse a Home Assistant timestamp; rows with this format will be skipped"
+        );
+    }
+    None
 }
 
 fn serialize_datetime<S: Serializer>(
@@ -208,6 +225,20 @@ mod tests {
                 .format(CH_DATETIME)
                 .unwrap(),
             "2026-10-11 16:10:02.250000"
+        );
+        assert_eq!(
+            parse_ha_timestamp("2026-10-11 18:10:02.123456+02:00")
+                .unwrap()
+                .format(CH_DATETIME)
+                .unwrap(),
+            "2026-10-11 16:10:02.123456"
+        );
+        assert_eq!(
+            parse_ha_timestamp("2026-10-11 16:10:02")
+                .unwrap()
+                .format(CH_DATETIME)
+                .unwrap(),
+            "2026-10-11 16:10:02.000000"
         );
         assert!(parse_ha_timestamp("yesterday").is_none());
     }

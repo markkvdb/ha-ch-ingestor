@@ -5,16 +5,33 @@
 //! reverse proxies. Authentication uses the `X-ClickHouse-User`/`-Key`
 //! headers, so credentials never end up in URLs.
 
+use std::collections::HashMap;
+
 use tokio::sync::watch;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::backoff::Backoff;
 use crate::config::ClickHouseConfig;
 use crate::error::{Error, Result};
 use crate::row::StateRow;
 
+/// Columns this build expects. A table created by the old Python ingester lacks
+/// `time_fired`; ClickHouse silently ignores unknown input fields, so without
+/// this check the data would be written with a missing column and millisecond
+/// precision without any error.
+const EXPECTED_COLUMNS: [&str; 8] = [
+    "entity_id",
+    "state",
+    "state_float",
+    "attributes",
+    "last_changed",
+    "last_updated",
+    "time_fired",
+    "ingested_at",
+];
+
 /// ClickHouse HTTP client.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClickHouse {
     client: reqwest::Client,
     base: url::Url,
@@ -75,7 +92,7 @@ impl ClickHouse {
             }
             match self.ensure_schema().await {
                 Ok(()) => return Ok(()),
-                Err(error) => {
+                Err(error) if error.is_transient() => {
                     let delay = backoff.next_delay();
                     error!(
                         error = %error,
@@ -87,6 +104,84 @@ impl ClickHouse {
                         _ = shutdown.changed() => return Err(Error::Shutdown),
                     }
                 }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Check that an existing table has the columns this build writes.
+    ///
+    /// A mismatch is a hard error: ClickHouse would otherwise accept the rows
+    /// and silently drop unknown fields.
+    pub async fn verify_schema(&self) -> Result<()> {
+        let sql = format!(
+            "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' \
+             FORMAT TabSeparated",
+            escape_literal(&self.database),
+            escape_literal(&self.table)
+        );
+        let body = self.query(&sql).await?;
+        let mut columns: HashMap<&str, &str> = HashMap::new();
+        for line in body.lines() {
+            if let Some((name, kind)) = line.split_once('\t') {
+                columns.insert(name.trim(), kind.trim());
+            }
+        }
+
+        let missing: Vec<&str> = EXPECTED_COLUMNS
+            .iter()
+            .copied()
+            .filter(|name| !columns.contains_key(name))
+            .collect();
+        if !missing.is_empty() {
+            return Err(Error::Schema(format!(
+                "table `{}`.`{}` is missing columns {missing:?}. Create a fresh table \
+                 (for example `states_v2`) and set CLICKHOUSE_TABLE, or migrate it first; \
+                 see README.md.",
+                self.database, self.table
+            )));
+        }
+        if let Some(kind) = columns.get("last_updated")
+            && !kind.contains("DateTime64(6")
+        {
+            warn!(
+                column = "last_updated",
+                data_type = %kind,
+                "existing table has lower timestamp precision; microseconds will be truncated"
+            );
+        }
+        Ok(())
+    }
+
+    /// Retry [`verify_schema`](Self::verify_schema) on transient failures.
+    pub async fn verify_schema_with_retry(
+        &self,
+        config: &crate::backoff::BackoffConfig,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
+        let mut backoff = Backoff::new(*config);
+        loop {
+            if *shutdown.borrow() {
+                return Err(Error::Shutdown);
+            }
+            match self.verify_schema().await {
+                Ok(()) => {
+                    info!(database = %self.database, table = %self.table, "clickhouse schema verified");
+                    return Ok(());
+                }
+                Err(error) if error.is_transient() => {
+                    let delay = backoff.next_delay();
+                    error!(
+                        error = %error,
+                        retry_in_ms = delay.as_millis() as u64,
+                        "could not verify the clickhouse schema yet"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(delay) => {}
+                        _ = shutdown.changed() => return Err(Error::Shutdown),
+                    }
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -140,6 +235,25 @@ impl ClickHouse {
         check_response(response).await
     }
 
+    async fn query(&self, sql: &str) -> Result<String> {
+        let response = self
+            .client
+            .post(self.base.clone())
+            .header("X-ClickHouse-User", &self.user)
+            .header("X-ClickHouse-Key", &self.password)
+            .header(reqwest::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(sql.to_owned())
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let body: String = body.chars().take(512).collect();
+            return Err(Error::ClickHouse { status, body });
+        }
+        Ok(response.text().await?)
+    }
+
     fn schema_ddl(&self) -> String {
         let mut ddl = format!(
             r"CREATE TABLE IF NOT EXISTS {}.{}
@@ -183,6 +297,11 @@ pub fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
+/// Quote a string literal for the `system.columns` lookup.
+fn escape_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +310,12 @@ mod tests {
     fn quotes_identifiers() {
         assert_eq!(quote_ident("states"), "`states`");
         assert_eq!(quote_ident("we`ird"), "`we``ird`");
+    }
+
+    #[test]
+    fn escapes_string_literals() {
+        assert_eq!(escape_literal("states"), "states");
+        assert_eq!(escape_literal("it's"), "it''s");
     }
 
     #[test]

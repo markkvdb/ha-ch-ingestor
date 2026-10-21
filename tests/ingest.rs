@@ -2,6 +2,7 @@
 //! wiremock ClickHouse. No Docker and no real credentials are involved.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -15,8 +16,25 @@ use tokio::sync::{Notify, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{WebSocketStream, accept_async};
 use url::Url;
-use wiremock::matchers::method;
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::matchers::{body_string_contains, method};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+const MODERN_COLUMNS: &str = "entity_id\tLowCardinality(String)\n\
+state\tString\n\
+state_float\tNullable(Float64)\n\
+attributes\tString\n\
+last_changed\tDateTime64(6, 'UTC')\n\
+last_updated\tDateTime64(6, 'UTC')\n\
+time_fired\tDateTime64(6, 'UTC')\n\
+ingested_at\tDateTime64(6, 'UTC')\n";
+
+const LEGACY_COLUMNS: &str = "entity_id\tLowCardinality(String)\n\
+state\tString\n\
+state_float\tNullable(Float64)\n\
+attributes\tString\n\
+last_changed\tDateTime64(3, 'UTC')\n\
+last_updated\tDateTime64(3, 'UTC')\n\
+ingested_at\tDateTime64(3, 'UTC')\n";
 
 fn backoff() -> BackoffConfig {
     BackoffConfig {
@@ -47,7 +65,9 @@ fn test_config(ws_url: Url, clickhouse_url: Url) -> Config {
         },
         batch: BatchConfig {
             size: 2,
-            interval: Duration::from_millis(100),
+            // Long on purpose: these tests exercise size-based and shutdown
+            // flushing, not the timer. A short interval made batch counts racy.
+            interval: Duration::from_secs(30),
             capacity: 100,
             drain_grace: Duration::from_secs(2),
             backoff: backoff(),
@@ -63,13 +83,50 @@ fn test_config(ws_url: Url, clickhouse_url: Url) -> Config {
     }
 }
 
+async fn schema_mock(server: &MockServer, columns: &str) {
+    Mock::given(method("POST"))
+        .and(body_string_contains("system.columns"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(columns.to_owned()))
+        .with_priority(1)
+        .mount(server)
+        .await;
+}
+
 async fn clickhouse_mock() -> MockServer {
     let server = MockServer::start().await;
+    schema_mock(&server, MODERN_COLUMNS).await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
+        .with_priority(5)
         .mount(&server)
         .await;
     server
+}
+
+#[derive(Clone)]
+struct FailOnce(Arc<AtomicUsize>);
+
+impl Respond for FailOnce {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(500)
+        } else {
+            ResponseTemplate::new(200)
+        }
+    }
+}
+
+fn insert_requests(requests: &[Request]) -> Vec<&Request> {
+    requests
+        .iter()
+        .filter(|request| {
+            request
+                .url
+                .query()
+                .unwrap_or_default()
+                .contains("JSONEachRow")
+        })
+        .collect()
 }
 
 async fn next_json(ws: &mut WebSocketStream<TcpStream>) -> Value {
@@ -397,4 +454,176 @@ async fn invalid_token_is_fatal() {
         .unwrap()
         .unwrap();
     assert!(matches!(result, Err(Error::Auth(_))), "got {result:?}");
+}
+
+fn spawn_ingester(
+    config: Config,
+) -> (
+    Arc<Notify>,
+    tokio::task::JoinHandle<Result<ha_ch_ingestor::StatsSnapshot, Error>>,
+) {
+    let notify = Arc::new(Notify::new());
+    let task_notify = Arc::clone(&notify);
+    let handle = tokio::spawn(run(config, async move {
+        task_notify.notified().await;
+    }));
+    (notify, handle)
+}
+
+#[tokio::test]
+async fn retries_a_transient_insert_error() {
+    let server = MockServer::start().await;
+    schema_mock(&server, MODERN_COLUMNS).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("sensor.retry"))
+        .respond_with(FailOnce(Arc::new(AtomicUsize::new(0))))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let (ws_url, _done) = spawn_fake_ha(
+        vec![event("sensor.retry", json!("1"), "2026-10-11T16:10:01Z")],
+        false,
+    )
+    .await;
+    let mut config = test_config(ws_url, Url::parse(&server.uri()).unwrap());
+    config.batch.size = 1;
+    let (notify, handle) = spawn_ingester(config);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let requests = server.received_requests().await.unwrap();
+        if insert_requests(&requests).len() >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the insert was not retried after a 500"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    notify.notify_one();
+    let stats = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats.inserted, 1);
+    assert_eq!(stats.insert_errors, 1);
+
+    let requests = server.received_requests().await.unwrap();
+    let inserts = insert_requests(&requests);
+    assert_eq!(inserts.len(), 2);
+    assert_eq!(
+        String::from_utf8_lossy(&inserts[0].body),
+        String::from_utf8_lossy(&inserts[1].body),
+        "the retry must send the same rows"
+    );
+}
+
+#[tokio::test]
+async fn a_permanent_insert_error_stops_the_process() {
+    let server = MockServer::start().await;
+    schema_mock(&server, MODERN_COLUMNS).await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("sensor.rejected"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let (ws_url, _done) = spawn_fake_ha(
+        vec![event("sensor.rejected", json!("1"), "2026-10-11T16:10:01Z")],
+        false,
+    )
+    .await;
+    let mut config = test_config(ws_url, Url::parse(&server.uri()).unwrap());
+    config.batch.size = 1;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(config, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            result,
+            Err(Error::ClickHouse { status, .. }) if status == reqwest::StatusCode::UNAUTHORIZED
+        ),
+        "got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn drains_the_buffer_on_shutdown() {
+    let server = clickhouse_mock().await;
+    let events = vec![
+        event("sensor.drain1", json!("1"), "2026-10-11T16:10:01Z"),
+        event("sensor.drain2", json!("2"), "2026-10-11T16:10:02Z"),
+        event("sensor.drain3", json!("3"), "2026-10-11T16:10:03Z"),
+    ];
+    let (ws_url, done) = spawn_fake_ha(events, false).await;
+    let mut config = test_config(ws_url, Url::parse(&server.uri()).unwrap());
+    config.batch.size = 10; // only the shutdown drain can flush these rows
+    let (notify, handle) = spawn_ingester(config);
+
+    tokio::time::timeout(Duration::from_secs(5), done)
+        .await
+        .unwrap()
+        .unwrap();
+    // Give the reader a moment to consume the frames that are already buffered.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    notify.notify_one();
+    let stats = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats.inserted, 3);
+
+    let requests = server.received_requests().await.unwrap();
+    let inserts = insert_requests(&requests);
+    assert_eq!(inserts.len(), 1);
+    assert_eq!(String::from_utf8_lossy(&inserts[0].body).lines().count(), 3);
+}
+
+#[tokio::test]
+async fn a_legacy_table_is_rejected() {
+    let server = MockServer::start().await;
+    schema_mock(&server, LEGACY_COLUMNS).await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+
+    let mut config = test_config(
+        Url::parse("ws://127.0.0.1:1/api/websocket").unwrap(),
+        Url::parse(&server.uri()).unwrap(),
+    );
+    config.create_schema = false;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(config, std::future::pending::<()>()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(result, Err(Error::Schema(ref message)) if message.contains("time_fired")),
+        "got {result:?}"
+    );
 }

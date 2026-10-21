@@ -9,7 +9,8 @@ no libc and no package manager.
 
 Replaces the Python ingestor from
 [`KolkhozIO/clickhouse-hassio`](https://github.com/KolkhozIO/clickhouse-hassio/tree/main/ingestor)
-with the same table shape, plus UTC microsecond timestamps.
+with the same table name and query columns, but UTC microsecond timestamps and
+a `time_fired` column.
 
 ---
 
@@ -24,8 +25,9 @@ HA Core ──state_changed──▶ ingestor ──HTTP JSONEachRow──▶ Cl
 ```
 
 * **Bounded memory.** A 10 000-row channel sits between the WebSocket reader
-  and the flusher. If ClickHouse is slow, backpressure reaches Home Assistant
-  instead of growing an unbounded `Vec`.
+  and the flusher, and attributes are capped at 256 KiB per row. If ClickHouse
+  is slow, backpressure reaches Home Assistant instead of growing an unbounded
+  `Vec`.
 * **At-least-once.** A failed insert is retried (1 → 60 s backoff) with the
   batch retained. On shutdown the queue is drained with a 15 s grace period.
 * **Self-healing.** Home Assistant disconnects, half-open TCP connections
@@ -38,6 +40,7 @@ HA Core ──state_changed──▶ ingestor ──HTTP JSONEachRow──▶ Cl
 
 ```bash
 docker run -d --name ha-ch-ingestor --restart unless-stopped \
+  --user "$(id -u):$(id -g)" \
   -e HA_WS_URL=ws://192.168.1.10:8123/api/websocket \
   -e HA_TOKEN_FILE=/run/secrets/ha_token \
   -v "$PWD/ha_token.txt:/run/secrets/ha_token:ro" \
@@ -50,6 +53,11 @@ docker run -d --name ha-ch-ingestor --restart unless-stopped \
 The token is a Home Assistant **long-lived access token**: Profile → Security →
 Long-lived access tokens. `HA_TOKEN` works too, but a mounted file keeps it out
 of `docker inspect` and shell history.
+
+The image runs as UID 65532 by default. On Linux, a token file with mode `0600`
+is not readable by that user, so `--user "$(id -u):$(id -g)"` makes the process
+run as your host user (still non-root). Alternatively `chmod 644` the mounted
+file.
 
 `HA_URL=http://192.168.1.10:8123` is accepted as an alternative to `HA_WS_URL`;
 the websocket path `/api/websocket` is derived automatically.
@@ -102,6 +110,26 @@ Differences from the original Python schema:
 * **`attributes` is ZSTD-compressed**, since these JSON blobs are the biggest
   part of the payload.
 
+On startup the ingester verifies the table and **refuses to write** when
+`time_fired` is missing. ClickHouse would otherwise accept the rows and quietly
+drop that field.
+
+### Migrating from the Python ingester
+
+`CREATE TABLE IF NOT EXISTS` does not alter an existing table. The old table has
+no `time_fired` and stores only milliseconds, so pointing this build at it
+produces a silent schema mismatch. Either create a fresh table (for example
+`states_v2`) and set `CLICKHOUSE_TABLE=states_v2`, or add the column manually:
+
+```sql
+ALTER TABLE homeassistant.states
+    ADD COLUMN IF NOT EXISTS time_fired DateTime64(6, 'UTC') DEFAULT last_updated;
+```
+
+The old table keeps millisecond precision and the `MergeTree` engine, so retry
+duplicates are not collapsed. A fresh table gets the full schema including
+`ReplacingMergeTree`.
+
 ### Timezones
 
 Storage is UTC; convert at query time:
@@ -152,7 +180,7 @@ Environment variables (highest priority), optionally `/data/options.json`
 | `BUFFER_CAPACITY` | `10000` | Bounded queue size (clamped to `BATCH_SIZE`) |
 | `INCLUDE_ATTRIBUTES` | `true` | Store the attributes JSON string |
 | `EXCLUDE_ENTITIES` | *(empty)* | Comma-separated `entity_id`s to skip |
-| `ATTRIBUTES_MAX_BYTES` | *(none)* | Store `""` above this size instead of large blobs |
+| `ATTRIBUTES_MAX_BYTES` | `262144` | Store `""` above this size instead of large blobs |
 | `CREATE_SCHEMA` | `true` | Run `CREATE DATABASE`/`CREATE TABLE` on startup |
 | `DRY_RUN` | `false` | Print NDJSON to stdout instead of inserting |
 | `LOG_FORMAT` | `text` | `text` or `json` |
@@ -168,8 +196,10 @@ CLI:
 --help / --version
 ```
 
-Exit codes: `0` clean shutdown, `78` configuration error, `1` fatal runtime
-error (e.g. Home Assistant rejected the token).
+Exit codes: `0` clean shutdown, `78` configuration or schema error, `1` fatal
+runtime error (e.g. Home Assistant rejected the token, or ClickHouse rejected
+the credentials). Permanent ClickHouse errors (400/401/403) stop the process
+instead of retrying forever; network errors and 5xx are retried.
 
 ### Proxies
 
@@ -182,7 +212,7 @@ TLS verification is always on.
 ## Development
 
 ```bash
-cargo test                                   # 27 unit + 3 integration tests
+cargo test                                   # 33 unit + 8 integration tests
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -232,4 +262,9 @@ The compose stack runs ClickHouse, a Rust fake Home Assistant
   that retries can create, eventually.
 * Events that arrive while the WebSocket is disconnected are missed. A snapshot
   or history backfill on reconnect is future work.
+* The queue is memory-only. `SIGTERM` drains it, but a hard kill (`SIGKILL`,
+  OOM) loses the buffered rows. If ClickHouse is still down after the 15 s
+  shutdown grace, the remaining rows are dropped and the error is logged.
+* Upgrading an existing Python-created table is not automatic; see
+  [Migrating from the Python ingester](#migrating-from-the-python-ingester).
 * No Prometheus endpoint; counters are logged every 60 s and at shutdown.

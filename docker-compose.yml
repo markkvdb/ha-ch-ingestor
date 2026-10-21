@@ -6,7 +6,7 @@ services:
       # user/password is configured. Fine for local development.
       CLICKHOUSE_SKIP_USER_SETUP: "1"
     ports:
-      - "8123:8123"
+      - "127.0.0.1:8123:8123"
     volumes:
       - clickhouse-data:/var/lib/clickhouse
 

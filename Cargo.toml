@@ -51,6 +51,9 @@ fastrand = "2"
 
 [dev-dependencies]
 wiremock = "0.6"
+rcgen = "0.14"
+tokio-rustls = "0.26"
+tokio = { version = "1.54", features = ["process"] }
 
 [features]
 default = ["tls"]

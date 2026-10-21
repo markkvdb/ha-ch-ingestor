@@ -28,7 +28,8 @@ pub async fn flush_loop(
     stats: Arc<Stats>,
     dry_run: bool,
 ) -> Result<()> {
-    let mut buffer: Vec<StateRow> = Vec::with_capacity(config.size);
+    // Do not reserve gigabytes for a typo like BATCH_SIZE=100000000.
+    let mut buffer: Vec<StateRow> = Vec::with_capacity(config.size.min(4096));
     let mut ticker = tokio::time::interval(config.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // discard the immediately-ready first tick
@@ -129,6 +130,14 @@ async fn flush(
             }
             Err(error) => {
                 stats.insert_errors.fetch_add(1, Ordering::Relaxed);
+                if !error.is_transient() {
+                    tracing::error!(
+                        rows,
+                        error = %error,
+                        "clickhouse rejected the batch; stopping instead of retrying forever"
+                    );
+                    return Err(error);
+                }
                 if deadline.is_none() && *shutdown.borrow() {
                     deadline = Some(Instant::now() + config.drain_grace);
                 }

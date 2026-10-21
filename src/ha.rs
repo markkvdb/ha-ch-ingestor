@@ -23,10 +23,11 @@ use serde_json::{Value, json};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 
 use crate::backoff::Backoff;
-use crate::config::{Filters, HaConfig};
+use crate::config::{Filters, HaConfig, redacted_url};
 use crate::error::{Error, Result};
 use crate::row::StateRow;
 use crate::stats::Stats;
@@ -37,6 +38,9 @@ type Stream = SplitStream<Ws>;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const SUBSCRIBE_ID: u64 = 1;
+/// The default is 64 MiB. Attributes can be large, but this keeps one message
+/// from pinning an unbounded amount of memory.
+const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 
 /// Consume `state_changed` events until shutdown, reconnecting on any
 /// recoverable error.
@@ -94,8 +98,12 @@ async fn session(
     stats: &Stats,
     backoff: &mut Backoff,
 ) -> Result<()> {
-    let (websocket, _response) = connect_async(config.ws_url.clone()).await?;
-    tracing::debug!(url = %config.ws_url, "websocket connected");
+    let websocket_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_SIZE))
+        .max_frame_size(Some(MAX_MESSAGE_SIZE));
+    let (websocket, _response) =
+        connect_async_with_config(config.ws_url.clone(), Some(websocket_config), false).await?;
+    tracing::debug!(url = %redacted_url(&config.ws_url), "websocket connected");
     let (mut sink, mut stream) = websocket.split();
 
     authenticate(&mut sink, &mut stream, &config.token).await?;

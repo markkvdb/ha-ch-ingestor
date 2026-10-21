@@ -29,3 +29,32 @@ jobs:
         run: cargo test --no-default-features
       - name: Build release (plaintext)
         run: cargo build --release --no-default-features
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build default image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha,scope=default
+          cache-to: type=gha,mode=max,scope=default
+      - name: Build plaintext image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          build-args: FEATURES=none
+          push: false
+          cache-from: type=gha,scope=slim
+          cache-to: type=gha,mode=max,scope=slim
+
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: check licenses

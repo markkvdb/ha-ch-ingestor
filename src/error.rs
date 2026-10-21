@@ -49,6 +49,10 @@ pub enum Error {
     #[error("home assistant protocol error: {0}")]
     Protocol(String),
 
+    /// The target table exists but does not match the schema this build writes.
+    #[error("schema mismatch: {0}")]
+    Schema(String),
+
     /// Nothing was received from Home Assistant within the idle timeout.
     #[error("home assistant sent nothing for {0:?}; reconnecting")]
     Idle(Duration),
@@ -60,4 +64,24 @@ pub enum Error {
     /// Local I/O, e.g. writing dry-run output or reading a token file.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl Error {
+    /// True when retrying the same operation can succeed.
+    ///
+    /// Network errors, server errors and rate limits are transient. Everything
+    /// else (bad credentials, missing permission, incompatible schema) will
+    /// keep failing until a human changes something.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Http(_) => true,
+            Self::ClickHouse { status, .. } => {
+                status.is_server_error()
+                    || *status == reqwest::StatusCode::REQUEST_TIMEOUT
+                    || *status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }
+            _ => false,
+        }
+    }
 }

@@ -1,5 +1,6 @@
 //! Command-line entry point.
 
+use std::io::IsTerminal as _;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -76,7 +77,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(Error::Shutdown) => ExitCode::SUCCESS,
-        Err(Error::Config(message)) => {
+        Err(Error::Config(message) | Error::Schema(message)) => {
             eprintln!("config error: {message}");
             ExitCode::from(EXIT_CONFIG)
         }
@@ -92,6 +93,8 @@ fn init_tracing(format: LogFormat) {
     let builder = fmt::Subscriber::builder()
         .with_env_filter(filter)
         .with_target(false)
+        // Keep escape codes out of collected logs; a terminal still gets them.
+        .with_ansi(std::io::stderr().is_terminal())
         // Logs go to stderr so `--dry-run` can own stdout.
         .with_writer(std::io::stderr);
     match format {

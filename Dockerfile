@@ -12,7 +12,7 @@
 # The same Dockerfile builds the fake HA server used by docker-compose:
 #   docker build --build-arg FEATURES=mock --build-arg BIN=mock_ha .
 # ---------------------------------------------------------------------------
-FROM rust:1-alpine AS builder
+FROM rust:1.99.1-alpine AS builder
 
 ARG FEATURES=tls
 ARG BIN=ha-ch-ingestor
@@ -36,7 +36,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     mkdir -p src/bin; \
     echo 'fn main() {}' > src/main.rs; \
     echo 'fn main() {}' > src/bin/mock_ha.rs; \
-    cargo build --release --no-default-features $FLAGS --bin ha-ch-ingestor; \
+    cargo build --release --locked --no-default-features $FLAGS --bin ha-ch-ingestor; \
     rm -rf src target/release/ha-ch-ingestor target/release/deps/ha_ch_ingestor*
 
 COPY src ./src
@@ -48,7 +48,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         none|"") FLAGS="" ;; \
         *) FLAGS="--features $FEATURES" ;; \
     esac; \
-    cargo build --release --no-default-features $FLAGS --bin "$BIN"; \
+    cargo build --release --locked --no-default-features $FLAGS --bin "$BIN"; \
     cp "target/release/$BIN" /out-binary
 
 # ---------------------------------------------------------------------------

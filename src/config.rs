@@ -21,6 +21,10 @@ use url::Url;
 use crate::backoff::BackoffConfig;
 use crate::error::{Error, Result};
 
+/// Cap attributes at 256 KiB by default. One event cannot use more than this in
+/// the queue, even if ClickHouse is down for a long time.
+pub const DEFAULT_MAX_ATTRIBUTES_BYTES: usize = 256 * 1024;
+
 /// Where logs are written and in which shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum LogFormat {
@@ -87,7 +91,7 @@ pub struct HaConfig {
 impl fmt::Debug for HaConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HaConfig")
-            .field("ws_url", &self.ws_url.as_str())
+            .field("ws_url", &redacted_url(&self.ws_url))
             .field("token", &"<redacted>")
             .field("heartbeat", &self.heartbeat)
             .field("idle_timeout", &self.idle_timeout)
@@ -120,7 +124,7 @@ pub struct ClickHouseConfig {
 impl fmt::Debug for ClickHouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClickHouseConfig")
-            .field("url", &self.url.as_str())
+            .field("url", &redacted_url(&self.url))
             .field("user", &self.user)
             .field("password", &"<redacted>")
             .field("database", &self.database)
@@ -175,7 +179,7 @@ impl Default for Filters {
         Self {
             include_attributes: true,
             exclude: HashSet::new(),
-            max_attributes_bytes: None,
+            max_attributes_bytes: Some(DEFAULT_MAX_ATTRIBUTES_BYTES),
         }
     }
 }
@@ -257,8 +261,11 @@ impl Config {
                 .list("EXCLUDE_ENTITIES", "exclude_entities")?
                 .into_iter()
                 .collect(),
-            max_attributes_bytes: sources
-                .parse::<usize>("ATTRIBUTES_MAX_BYTES", "attributes_max_bytes")?,
+            max_attributes_bytes: Some(
+                sources
+                    .parse::<usize>("ATTRIBUTES_MAX_BYTES", "attributes_max_bytes")?
+                    .unwrap_or(DEFAULT_MAX_ATTRIBUTES_BYTES),
+            ),
         };
 
         let log_format = match overrides.log_format {
@@ -289,13 +296,13 @@ impl Config {
     pub fn redacted_json(&self) -> Value {
         json!({
             "ha": {
-                "ws_url": self.ha.ws_url.as_str(),
+                "ws_url": redacted_url(&self.ha.ws_url),
                 "token": if self.ha.token.is_empty() { "" } else { "<redacted>" },
                 "heartbeat_secs": self.ha.heartbeat.as_secs(),
                 "idle_timeout_secs": self.ha.idle_timeout.as_secs(),
             },
             "clickhouse": {
-                "url": self.ch.url.as_str(),
+                "url": redacted_url(&self.ch.url),
                 "user": &self.ch.user,
                 "password": if self.ch.password.is_empty() { "" } else { "<redacted>" },
                 "database": &self.ch.database,
@@ -349,6 +356,7 @@ fn resolve_clickhouse_url(sources: &Sources, dry_run: bool) -> Result<Url> {
         }
     };
     ensure_scheme(&url, &["http", "https"], "CLICKHOUSE_URL")?;
+    ensure_no_credentials(&url, "CLICKHOUSE_URL")?;
     Ok(url)
 }
 
@@ -366,6 +374,7 @@ fn resolve_ws_url(sources: &Sources) -> Result<Url> {
         ));
     };
     ensure_scheme(&url, &["ws", "wss"], "HA_WS_URL")?;
+    ensure_no_credentials(&url, "HA_WS_URL")?;
     Ok(url)
 }
 
@@ -404,10 +413,44 @@ fn url_from_http(raw: &str) -> Result<Url> {
     };
     url.set_scheme(scheme)
         .map_err(|()| Error::Config("could not derive websocket scheme from HA_URL".to_owned()))?;
-    url.set_path("/api/websocket");
+    // Keep a reverse-proxy prefix (`https://host/ha/` -> `/ha/api/websocket`),
+    // and accept the REST base (`https://host/api/`) without doubling `/api`.
+    let path = url.path().trim_end_matches('/');
+    let websocket_path = if path.is_empty() {
+        "/api/websocket".to_owned()
+    } else if path.ends_with("/api") {
+        format!("{path}/websocket")
+    } else {
+        format!("{path}/api/websocket")
+    };
+    url.set_path(&websocket_path);
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
+}
+
+/// Reject `user:password@host` in a URL. Credentials belong in the explicit
+/// config fields so they can be redacted reliably.
+fn ensure_no_credentials(url: &Url, name: &str) -> Result<()> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(Error::Config(format!(
+            "{name} must not contain credentials; use CLICKHOUSE_USER/CLICKHOUSE_PASSWORD for \
+             ClickHouse and HA_TOKEN for Home Assistant"
+        )));
+    }
+    Ok(())
+}
+
+/// Render a URL without credentials, query or fragment, for logs and
+/// `--print-config`.
+#[must_use]
+pub(crate) fn redacted_url(url: &Url) -> String {
+    let mut clean = url.clone();
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+    clean.set_query(None);
+    clean.set_fragment(None);
+    clean.to_string()
 }
 
 fn ensure_scheme(url: &Url, allowed: &[&str], name: &str) -> Result<()> {
@@ -648,6 +691,81 @@ mod tests {
         assert_eq!(
             config.ha.ws_url.as_str(),
             "wss://home.example/api/websocket"
+        );
+    }
+
+    #[test]
+    fn derives_websocket_url_from_a_bare_ha_url() {
+        let config = parse(
+            &[
+                ("CLICKHOUSE_HOST", "clickhouse"),
+                ("HA_URL", "https://home.example"),
+                ("HA_TOKEN", "token"),
+            ],
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            config.ha.ws_url.as_str(),
+            "wss://home.example/api/websocket"
+        );
+    }
+
+    #[test]
+    fn keeps_a_reverse_proxy_path() {
+        let config = parse(
+            &[
+                ("CLICKHOUSE_HOST", "clickhouse"),
+                ("HA_URL", "https://home.example/ha/"),
+                ("HA_TOKEN", "token"),
+            ],
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            config.ha.ws_url.as_str(),
+            "wss://home.example/ha/api/websocket"
+        );
+    }
+
+    #[test]
+    fn rejects_credentials_in_urls() {
+        for (key, value) in [
+            ("CLICKHOUSE_URL", "http://user:pass@clickhouse:8123"),
+            ("HA_WS_URL", "ws://user:pass@ha.local:8123/api/websocket"),
+        ] {
+            let mut env = minimal();
+            env.push((key, value));
+            let error = parse(&env, json!({})).unwrap_err();
+            assert!(matches!(error, Error::Config(message) if message.contains("credentials")));
+        }
+    }
+
+    #[test]
+    fn redacts_url_credentials_and_query() {
+        let config = parse(
+            &[
+                ("CLICKHOUSE_URL", "http://clickhouse:8123"),
+                (
+                    "HA_WS_URL",
+                    "ws://ha.local:8123/api/websocket?access_token=abc123secret",
+                ),
+                ("HA_TOKEN", "token"),
+            ],
+            json!({}),
+        )
+        .unwrap();
+        let rendered = config.redacted_json().to_string();
+        assert!(!rendered.contains("abc123secret"));
+        assert!(rendered.contains("ws://ha.local:8123/api/websocket"));
+    }
+
+    #[test]
+    fn attributes_cap_has_a_safe_default() {
+        let config = parse(&minimal(), json!({})).unwrap();
+        assert_eq!(
+            config.filters.max_attributes_bytes,
+            Some(DEFAULT_MAX_ATTRIBUTES_BYTES)
         );
     }
 
