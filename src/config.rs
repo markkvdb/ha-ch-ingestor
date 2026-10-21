@@ -145,6 +145,8 @@ pub struct BatchConfig {
     pub interval: Duration,
     /// Bounded channel capacity. Backpressure starts when this is full.
     pub capacity: usize,
+    /// Maximum bytes held by queued and in-flight rows together.
+    pub max_bytes: usize,
     /// How long to keep retrying a batch during shutdown.
     pub drain_grace: Duration,
     /// Insert retry backoff.
@@ -157,6 +159,7 @@ impl Default for BatchConfig {
             size: 500,
             interval: Duration::from_secs(5),
             capacity: 10_000,
+            max_bytes: 32 * 1024 * 1024,
             drain_grace: Duration::from_secs(15),
             backoff: BackoffConfig::default(),
         }
@@ -246,10 +249,21 @@ impl Config {
             .parse::<usize>("BUFFER_CAPACITY", "buffer_capacity")?
             .unwrap_or(10_000)
             .max(size);
+        let max_bytes = sources
+            .parse::<usize>("BUFFER_MAX_BYTES", "buffer_max_bytes")?
+            .unwrap_or(BatchConfig::default().max_bytes);
+        if max_bytes == 0
+            || max_bytes > (u32::MAX as usize).min(tokio::sync::Semaphore::MAX_PERMITS)
+        {
+            return Err(Error::Config(
+                "BUFFER_MAX_BYTES must be positive and fit the semaphore limit".into(),
+            ));
+        }
         let batch = BatchConfig {
             size,
             interval,
             capacity,
+            max_bytes,
             ..BatchConfig::default()
         };
 
@@ -313,6 +327,7 @@ impl Config {
                 "size": self.batch.size,
                 "flush_interval_secs": self.batch.interval.as_secs(),
                 "capacity": self.batch.capacity,
+                "max_bytes": self.batch.max_bytes,
                 "drain_grace_secs": self.batch.drain_grace.as_secs(),
             },
             "filters": {
@@ -613,6 +628,26 @@ mod tests {
         assert_eq!(config.ch.table, "states");
         assert_eq!(config.batch.size, 500);
         assert_eq!(config.batch.capacity, 10_000);
+    }
+
+    #[test]
+    fn validates_the_byte_budget() {
+        assert_eq!(
+            parse(&minimal(), json!({})).unwrap().batch.max_bytes,
+            32 * 1024 * 1024
+        );
+        for value in ["0", "4294967296"] {
+            let mut env = minimal();
+            env.push(("BUFFER_MAX_BYTES", value));
+            assert!(matches!(parse(&env, json!({})), Err(Error::Config(_))));
+        }
+        assert_eq!(
+            parse(&minimal(), json!({"buffer_max_bytes": 4096}))
+                .unwrap()
+                .batch
+                .max_bytes,
+            4096
+        );
     }
 
     #[test]

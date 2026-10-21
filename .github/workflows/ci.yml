@@ -17,6 +17,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      - name: Deployment script checks
+        run: bash tests/deploy-proxmox.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy (default features)

@@ -61,6 +61,10 @@ pub enum Error {
     #[error("shutdown requested")]
     Shutdown,
 
+    /// The shared shutdown deadline expired before all rows were acknowledged.
+    #[error("shutdown drain deadline exceeded; pending rows were not acknowledged")]
+    DrainTimeout,
+
     /// Local I/O, e.g. writing dry-run output or reading a token file.
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),

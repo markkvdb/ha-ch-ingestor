@@ -47,7 +47,9 @@ const MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 pub async fn stream(
     config: HaConfig,
     filters: Filters,
-    sender: mpsc::Sender<StateRow>,
+    memory: Arc<tokio::sync::Semaphore>,
+    memory_limit: usize,
+    sender: mpsc::Sender<crate::queue::QueuedRow>,
     mut shutdown: watch::Receiver<bool>,
     stats: Arc<Stats>,
 ) -> Result<()> {
@@ -57,16 +59,12 @@ pub async fn stream(
         if *shutdown.borrow() {
             return Ok(());
         }
-        match session(
-            &config,
-            &filters,
-            &sender,
-            &mut shutdown,
-            &stats,
-            &mut backoff,
-        )
-        .await
-        {
+        let result = tokio::select! {
+            biased;
+            _ = async { let _ = shutdown.wait_for(|requested| *requested).await; } => return Ok(()),
+            result = session(&config, &filters, &memory, memory_limit, &sender, &stats, &mut backoff) => result,
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(Error::Shutdown) => return Ok(()),
             Err(Error::Auth(message)) => {
@@ -93,21 +91,26 @@ pub async fn stream(
 async fn session(
     config: &HaConfig,
     filters: &Filters,
-    sender: &mpsc::Sender<StateRow>,
-    shutdown: &mut watch::Receiver<bool>,
+    memory: &Arc<tokio::sync::Semaphore>,
+    memory_limit: usize,
+    sender: &mpsc::Sender<crate::queue::QueuedRow>,
     stats: &Stats,
     backoff: &mut Backoff,
 ) -> Result<()> {
     let websocket_config = WebSocketConfig::default()
         .max_message_size(Some(MAX_MESSAGE_SIZE))
         .max_frame_size(Some(MAX_MESSAGE_SIZE));
-    let (websocket, _response) =
-        connect_async_with_config(config.ws_url.clone(), Some(websocket_config), false).await?;
-    tracing::debug!(url = %redacted_url(&config.ws_url), "websocket connected");
-    let (mut sink, mut stream) = websocket.split();
-
-    authenticate(&mut sink, &mut stream, &config.token).await?;
-    subscribe(&mut sink, &mut stream).await?;
+    let (mut sink, mut stream) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let (websocket, _response) =
+            connect_async_with_config(config.ws_url.clone(), Some(websocket_config), false).await?;
+        tracing::debug!(url = %redacted_url(&config.ws_url), "websocket connected");
+        let (mut sink, mut stream) = websocket.split();
+        authenticate(&mut sink, &mut stream, &config.token).await?;
+        subscribe(&mut sink, &mut stream).await?;
+        Ok::<_, Error>((sink, stream))
+    })
+    .await
+    .map_err(|_| Error::Protocol("home assistant connection/handshake timed out".into()))??;
     backoff.reset();
     tracing::info!("subscribed to state_changed events");
 
@@ -119,18 +122,14 @@ async fn session(
 
     loop {
         tokio::select! {
-            biased;
-            _ = shutdown.changed() => {
-                let _ = sink.close().await;
-                return Ok(());
-            }
             _ = ticker.tick() => {
                 if last_received.elapsed() > config.idle_timeout {
                     return Err(Error::Idle(config.idle_timeout));
                 }
                 let ping = json!({"id": ping_id, "type": "ping"});
                 ping_id += 1;
-                sink.send(Message::Text(ping.to_string().into())).await?;
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, sink.send(Message::Text(ping.to_string().into())))
+                    .await.map_err(|_| Error::Idle(HANDSHAKE_TIMEOUT))??;
             }
             incoming = stream.next() => {
                 let Some(message) = incoming else {
@@ -140,16 +139,17 @@ async fn session(
                 last_received = Instant::now();
                 match message {
                     Message::Text(text) => {
-                        handle_message(text.as_str(), filters, sender, stats).await?;
+                        handle_message(text.as_str(), filters, memory, memory_limit, sender, stats).await?;
                     }
                     Message::Binary(bytes) => {
                         let text = std::str::from_utf8(&bytes).map_err(|error| {
                             Error::Protocol(format!("non-utf8 websocket frame: {error}"))
                         })?;
-                        handle_message(text, filters, sender, stats).await?;
+                        handle_message(text, filters, memory, memory_limit, sender, stats).await?;
                     }
                     Message::Ping(payload) => {
-                        sink.send(Message::Pong(payload)).await?;
+                        tokio::time::timeout(HANDSHAKE_TIMEOUT, sink.send(Message::Pong(payload)))
+                            .await.map_err(|_| Error::Idle(HANDSHAKE_TIMEOUT))??;
                     }
                     Message::Close(_) => {
                         return Err(Error::Protocol("websocket closed by home assistant".into()));
@@ -246,7 +246,9 @@ async fn next_json(stream: &mut Stream) -> Result<Value> {
 async fn handle_message(
     raw: &str,
     filters: &Filters,
-    sender: &mpsc::Sender<StateRow>,
+    memory: &Arc<tokio::sync::Semaphore>,
+    memory_limit: usize,
+    sender: &mpsc::Sender<crate::queue::QueuedRow>,
     stats: &Stats,
 ) -> Result<()> {
     let message: Value = serde_json::from_str(raw)?;
@@ -268,7 +270,8 @@ async fn handle_message(
     let time_fired = event.get("time_fired").and_then(Value::as_str);
     match StateRow::from_new_state(new_state, time_fired, filters) {
         Some(row) => {
-            sender.send(row).await.map_err(|_| Error::Shutdown)?;
+            let queued = crate::queue::QueuedRow::reserve(row, memory, memory_limit).await?;
+            sender.send(queued).await.map_err(|_| Error::Shutdown)?;
             stats.rows.fetch_add(1, Ordering::Relaxed);
         }
         None => {
@@ -276,4 +279,42 @@ async fn handle_message(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_includes_the_websocket_http_upgrade() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = HaConfig {
+            ws_url: url::Url::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap(),
+            token: "test-token".into(),
+            heartbeat: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(90),
+            backoff: Default::default(),
+        };
+        let (sender, _receiver) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            session(
+                &config,
+                &Filters::default(),
+                &Arc::new(tokio::sync::Semaphore::new(1024)),
+                1024,
+                &sender,
+                &Stats::default(),
+                &mut Backoff::new(config.backoff),
+            )
+            .await
+        });
+        let (_connection, _) = listener.accept().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(HANDSHAKE_TIMEOUT + Duration::from_secs(1)).await;
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("upgrade was not timed out")
+            .unwrap();
+        assert!(matches!(result, Err(Error::Protocol(message)) if message.contains("timed out")));
+    }
 }

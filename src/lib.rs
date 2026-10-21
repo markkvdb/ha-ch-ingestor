@@ -25,6 +25,7 @@ pub mod clickhouse;
 pub mod config;
 pub mod error;
 pub mod ha;
+pub mod queue;
 pub mod row;
 pub mod stats;
 
@@ -54,24 +55,36 @@ pub async fn run(
     });
 
     let clickhouse = clickhouse::ClickHouse::new(&config.ch)?;
-    if config.dry_run {
-        tracing::info!("dry-run: ClickHouse will not be contacted");
-    } else {
-        if config.create_schema {
-            clickhouse
-                .ensure_schema_with_retry(&config.ch.backoff, shutdown_receiver.clone())
-                .await?;
+    let mut startup_stop = shutdown_receiver.clone();
+    let startup = async {
+        if config.dry_run {
+            tracing::info!("dry-run: ClickHouse will not be contacted");
         } else {
-            tracing::info!("schema creation disabled; verifying the existing table");
+            if config.create_schema {
+                clickhouse
+                    .ensure_schema_with_retry(&config.ch.backoff, shutdown_receiver.clone())
+                    .await?;
+            } else {
+                tracing::info!("schema creation disabled; verifying the existing table");
+            }
+            // A legacy table silently swallows `time_fired`; refuse to write into it.
+            clickhouse
+                .verify_schema_with_retry(&config.ch.backoff, shutdown_receiver.clone())
+                .await?;
         }
-        // A legacy table silently swallows `time_fired`; refuse to write into it.
-        clickhouse
-            .verify_schema_with_retry(&config.ch.backoff, shutdown_receiver.clone())
-            .await?;
+
+        Ok::<_, Error>(())
+    };
+    tokio::select! {
+        biased;
+        _ = async { let _ = startup_stop.wait_for(|requested| *requested).await; } => return Err(Error::Shutdown),
+        result = startup => result?,
     }
 
     let (sender, receiver) = mpsc::channel(config.batch.capacity);
 
+    let memory = Arc::new(tokio::sync::Semaphore::new(config.batch.max_bytes));
+    let drain_timeout = config.batch.drain_grace + Duration::from_secs(1);
     let mut flusher = tokio::spawn(batch::flush_loop(
         clickhouse,
         receiver,
@@ -83,6 +96,8 @@ pub async fn run(
     let mut websocket = tokio::spawn(ha::stream(
         config.ha,
         config.filters,
+        memory,
+        config.batch.max_bytes,
         sender,
         shutdown_receiver.clone(),
         Arc::clone(&stats),
@@ -95,7 +110,9 @@ pub async fn run(
     // Watch both tasks: the WebSocket task can end on shutdown/auth failure,
     // and the flusher can end on a permanent ClickHouse error. Waiting for only
     // one of them can leave the process alive with nothing happening.
+    let mut stop = shutdown_receiver.clone();
     let (websocket_ended, flusher_ended) = tokio::select! {
+        _ = async { let _ = stop.wait_for(|requested| *requested).await; } => (None, None),
         result = &mut websocket => (Some(result), None),
         result = &mut flusher => (None, Some(result)),
     };
@@ -108,7 +125,7 @@ pub async fn run(
     };
     let flush_result = match flusher_ended {
         Some(result) => join_result(result, "flush"),
-        None => finish_task(&mut flusher, TASK_SHUTDOWN_TIMEOUT, "flush").await,
+        None => finish_task(&mut flusher, drain_timeout, "flush").await,
     };
     let _ = reporter.await;
 
@@ -145,9 +162,14 @@ async fn finish_task(
     timeout: Duration,
     task: &str,
 ) -> Result<()> {
-    let result = tokio::time::timeout(timeout, handle)
-        .await
-        .map_err(|_| Error::Protocol(format!("{task} task did not stop in time")))?;
+    let result = match tokio::time::timeout(timeout, &mut *handle).await {
+        Ok(result) => result,
+        Err(_) => {
+            handle.abort();
+            let _ = handle.await;
+            return Err(Error::Protocol(format!("{task} task did not stop in time")));
+        }
+    };
     join_result(result, task)
 }
 

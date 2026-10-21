@@ -53,7 +53,7 @@ fastrand = "2"
 wiremock = "0.6"
 rcgen = "0.14"
 tokio-rustls = "0.26"
-tokio = { version = "1.54", features = ["process"] }
+tokio = { version = "1.54", features = ["process", "test-util"] }
 
 [features]
 default = ["tls"]

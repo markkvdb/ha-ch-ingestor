@@ -24,14 +24,17 @@ HA Core ──state_changed──▶ ingestor ──HTTP JSONEachRow──▶ Cl
                               └─ bounded queue + retrying batches
 ```
 
-* **Bounded memory.** A 10 000-row channel sits between the WebSocket reader
-  and the flusher, and attributes are capped at 256 KiB per row. If ClickHouse
-  is slow, backpressure reaches Home Assistant instead of growing an unbounded
-  `Vec`.
-* **At-least-once.** A failed insert is retried (1 → 60 s backoff) with the
-  batch retained. On shutdown the queue is drained with a 15 s grace period.
-* **Self-healing.** Home Assistant disconnects, half-open TCP connections
-  (90 s idle timeout) and ClickHouse restarts are all recovered automatically.
+* **Bounded buffering.** The queue and in-flight batch share a 32 MiB row-memory
+  budget, plus a 10 000-row channel limit. Attributes are capped at 256 KiB per
+  row. HTTP serialization and the current WebSocket message use additional memory.
+  When either queue limit is reached, the reader waits instead of growing memory.
+* **Retrying delivery.** A failed insert is retried (1 → 60 s backoff) with the
+  batch retained. Success requires the complete HTTP response, not just a 200
+  status. On shutdown, one 15 s deadline covers all draining and retries.
+  This is not lossless recording: crashes and disconnected periods can lose events.
+* **Self-healing.** Home Assistant disconnects, stalled connection/handshakes
+  (15 s timeout), half-open TCP connections (90 s idle timeout) and ClickHouse
+  restarts are recovered automatically.
 * **No lost startup race.** Schema creation is retried until ClickHouse is up.
 
 ---
@@ -45,8 +48,9 @@ docker run -d --name ha-ch-ingestor --restart unless-stopped \
   -e HA_TOKEN_FILE=/run/secrets/ha_token \
   -v "$PWD/ha_token.txt:/run/secrets/ha_token:ro" \
   -e CLICKHOUSE_URL=http://192.168.1.10:8123 \
-  -e CLICKHOUSE_USER=default \
+  -e CLICKHOUSE_USER=ha_ingestor \
   -e CLICKHOUSE_PASSWORD=secret \
+  -e CREATE_SCHEMA=false \
   ghcr.io/markkvdb/ha-ch-ingestor:latest
 ```
 
@@ -71,6 +75,70 @@ the websocket path `/api/websocket` is derived automatically.
 
 The slim build can only use `ws://` and `http://`. Use it when both ends are on
 a trusted LAN.
+
+---
+
+## Deploy on Proxmox VE (lean, no Docker)
+
+`scripts/deploy-proxmox.sh` runs from your workstation. It builds the static
+`linux/amd64` (or `arm64`) binary, then creates or updates an unprivileged
+Debian LXC on a Proxmox node over SSH. Inside the LXC it installs the binary, a
+systemd unit and the config file. No Docker runs on the Proxmox host or in the
+container, and the container opens no ports.
+
+Requirements: SSH to a Proxmox node as root or with passwordless sudo, local
+Docker (or `--binary`), and internet access on the node for the Debian template.
+
+```bash
+./scripts/deploy-proxmox.sh \
+  --pve root@192.168.1.5 \
+  --ha-url http://192.168.1.10:8123 \
+  --clickhouse-url http://192.168.1.20:8123
+```
+
+The Home Assistant token defaults to `../ha_token.txt`; otherwise pass
+`--ha-token-file`. ClickHouse credentials come from
+`--clickhouse-password-file`, `CLICKHOUSE_PASSWORD`, or an interactive prompt.
+For a static IP:
+
+```bash
+./scripts/deploy-proxmox.sh ... \
+  --ip 192.168.1.60/24 --gateway 192.168.1.1 --nameserver 192.168.1.1
+```
+
+Re-running the script finds the container by hostname and updates it; use
+`--ctid` to target a specific container. `--dry-run` prints the plan without
+touching anything, and `--help` lists every option.
+
+The script forwards `RETENTION_DAYS`, `BUFFER_CAPACITY`, `BUFFER_MAX_BYTES`,
+`INCLUDE_ATTRIBUTES`, `EXCLUDE_ENTITIES`, `ATTRIBUTES_MAX_BYTES` and `LOG_FORMAT`
+from your environment into the service configuration. Retention only applies
+when creating a table; updates never change retention or delete existing history.
+
+### ClickHouse access
+
+For production, provision the schema with an administrator, then use a dedicated
+password-protected user and `--no-create-schema` (or `CREATE_SCHEMA=false`). For
+example, execute as an administrator, replacing the password and subnet:
+
+```sql
+CREATE USER ha_ingestor IDENTIFIED WITH sha256_password BY 'replace-with-a-strong-password'
+    HOST IP '192.168.1.0/24';
+GRANT INSERT ON homeassistant.states TO ha_ingestor;
+GRANT SELECT ON system.columns TO ha_ingestor;
+
+CREATE USER ha_reader IDENTIFIED WITH sha256_password BY 'replace-with-another-strong-password'
+    HOST IP '192.168.1.0/24';
+GRANT SELECT ON homeassistant.states TO ha_reader;
+```
+
+Use `ha_reader` for dashboards and queries (`curl --user ha_reader` prompts for
+its password).
+Restrict the administrator/default account to loopback, require a password,
+and restrict the database network to trusted clients. Do not use an unrestricted,
+passwordless `default` account. Use HTTPS/WSS or a protected network: plaintext
+HTTP/WebSocket connections expose credentials to network observers.
+
 
 ---
 
@@ -110,25 +178,18 @@ Differences from the original Python schema:
 * **`attributes` is ZSTD-compressed**, since these JSON blobs are the biggest
   part of the payload.
 
-On startup the ingester verifies the table and **refuses to write** when
-`time_fired` is missing. ClickHouse would otherwise accept the rows and quietly
-drop that field.
+On startup the ingester verifies column names and compatible types. All four
+timestamps must be `DateTime64` with precision 6–9 and explicit `UTC`; numeric
+states require `Nullable(Float64)`. Missing or incompatible columns stop startup.
+Unknown insert fields are rejected, and async inserts must wait for acknowledgement.
 
 ### Migrating from the Python ingester
 
-`CREATE TABLE IF NOT EXISTS` does not alter an existing table. The old table has
-no `time_fired` and stores only milliseconds, so pointing this build at it
-produces a silent schema mismatch. Either create a fresh table (for example
-`states_v2`) and set `CLICKHOUSE_TABLE=states_v2`, or add the column manually:
-
-```sql
-ALTER TABLE homeassistant.states
-    ADD COLUMN IF NOT EXISTS time_fired DateTime64(6, 'UTC') DEFAULT last_updated;
-```
-
-The old table keeps millisecond precision and the `MergeTree` engine, so retry
-duplicates are not collapsed. A fresh table gets the full schema including
-`ReplacingMergeTree`.
+`CREATE TABLE IF NOT EXISTS` does not alter an existing table. The old table
+lacks `time_fired` and uses milliseconds, so it is rejected. Create a fresh table
+(for example `states_v2`) and set `CLICKHOUSE_TABLE=states_v2`. Backfill old data
+separately after checking its timezone and precision; previously discarded
+microseconds cannot be recovered. Adding only `time_fired` is not sufficient.
 
 ### Timezones
 
@@ -178,6 +239,7 @@ Environment variables (highest priority), optionally `/data/options.json`
 | `BATCH_SIZE` | `500` | Flush after this many rows |
 | `FLUSH_INTERVAL` | `5` | Flush at least every n seconds |
 | `BUFFER_CAPACITY` | `10000` | Bounded queue size (clamped to `BATCH_SIZE`) |
+| `BUFFER_MAX_BYTES` | `33554432` | Shared row-memory budget for the queue and in-flight batch; must fit at least one row |
 | `INCLUDE_ATTRIBUTES` | `true` | Store the attributes JSON string |
 | `EXCLUDE_ENTITIES` | *(empty)* | Comma-separated `entity_id`s to skip |
 | `ATTRIBUTES_MAX_BYTES` | `262144` | Store `""` above this size instead of large blobs |
@@ -212,7 +274,8 @@ TLS verification is always on.
 ## Development
 
 ```bash
-cargo test                                   # 33 unit + 8 integration tests
+cargo test
+bash tests/deploy-proxmox.sh                  # no SSH or Docker needed
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -263,8 +326,10 @@ The compose stack runs ClickHouse, a Rust fake Home Assistant
 * Events that arrive while the WebSocket is disconnected are missed. A snapshot
   or history backfill on reconnect is future work.
 * The queue is memory-only. `SIGTERM` drains it, but a hard kill (`SIGKILL`,
-  OOM) loses the buffered rows. If ClickHouse is still down after the 15 s
-  shutdown grace, the remaining rows are dropped and the error is logged.
+  OOM) loses the buffered rows. When the shared 15 s shutdown deadline expires,
+  remaining rows are dropped and an error is returned. A small byte budget also
+  shortens the outage window that fits in memory; a single row larger than the
+  budget is rejected and logged.
 * Upgrading an existing Python-created table is not automatic; see
   [Migrating from the Python ingester](#migrating-from-the-python-ingester).
 * No Prometheus endpoint; counters are logged every 60 s and at shutdown.

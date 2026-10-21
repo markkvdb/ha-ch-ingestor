@@ -69,6 +69,7 @@ fn test_config(ws_url: Url, clickhouse_url: Url) -> Config {
             // flushing, not the timer. A short interval made batch counts racy.
             interval: Duration::from_secs(30),
             capacity: 100,
+            max_bytes: 32 * 1024 * 1024,
             drain_grace: Duration::from_secs(2),
             backoff: backoff(),
         },
@@ -626,4 +627,254 @@ async fn a_legacy_table_is_rejected() {
         matches!(result, Err(Error::Schema(ref message)) if message.contains("time_fired")),
         "got {result:?}"
     );
+}
+
+#[tokio::test]
+async fn rejects_incompatible_column_types() {
+    for column in ["last_changed", "last_updated", "time_fired", "ingested_at"] {
+        for kind in [
+            "DateTime64(3, 'UTC')",
+            "DateTime64(6, 'Europe/Paris')",
+            "DateTime64(6)",
+        ] {
+            let server = MockServer::start().await;
+            let columns = MODERN_COLUMNS.replace(
+                &format!("{column}\tDateTime64(6, 'UTC')"),
+                &format!("{column}\t{kind}"),
+            );
+            schema_mock(&server, &columns).await;
+            let config = test_config(
+                Url::parse("ws://localhost").unwrap(),
+                Url::parse(&server.uri()).unwrap(),
+            );
+            let client = ha_ch_ingestor::clickhouse::ClickHouse::new(&config.ch).unwrap();
+            assert!(
+                matches!(client.verify_schema().await, Err(Error::Schema(_))),
+                "accepted {column}: {kind}"
+            );
+        }
+    }
+    for (column, kind) in [
+        ("state_float", "Float32"),
+        ("attributes", "UInt64"),
+        ("entity_id", "UInt64"),
+    ] {
+        let server = MockServer::start().await;
+        let columns = MODERN_COLUMNS
+            .lines()
+            .map(|line| {
+                if line.starts_with(&format!("{column}\t")) {
+                    format!("{column}\t{kind}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        schema_mock(&server, &columns).await;
+        let config = test_config(
+            Url::parse("ws://localhost").unwrap(),
+            Url::parse(&server.uri()).unwrap(),
+        );
+        let client = ha_ch_ingestor::clickhouse::ClickHouse::new(&config.ch).unwrap();
+        assert!(matches!(
+            client.verify_schema().await,
+            Err(Error::Schema(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn accepts_higher_precision_utc_columns() {
+    let server = MockServer::start().await;
+    schema_mock(
+        &server,
+        &MODERN_COLUMNS.replace("DateTime64(6,", "DateTime64(9,"),
+    )
+    .await;
+    let config = test_config(
+        Url::parse("ws://localhost").unwrap(),
+        Url::parse(&server.uri()).unwrap(),
+    );
+    let client = ha_ch_ingestor::clickhouse::ClickHouse::new(&config.ch).unwrap();
+    client.verify_schema().await.unwrap();
+}
+
+#[tokio::test]
+async fn successful_http_status_does_not_hide_errors() {
+    use ha_ch_ingestor::row::StateRow;
+    for (body, header) in [
+        ("Code: 241. DB::Exception: late failure", false),
+        ("\r\n__exception__\r\nlate failure", false),
+        ("", true),
+        ("unexpected proxy response", false),
+    ] {
+        let server = MockServer::start().await;
+        let mut response = ResponseTemplate::new(200).set_body_string(body);
+        if header {
+            response = response.insert_header("X-ClickHouse-Exception-Code", "241");
+        }
+        Mock::given(method("POST"))
+            .respond_with(response)
+            .mount(&server)
+            .await;
+        let config = test_config(
+            Url::parse("ws://localhost").unwrap(),
+            Url::parse(&server.uri()).unwrap(),
+        );
+        let client = ha_ch_ingestor::clickhouse::ClickHouse::new(&config.ch).unwrap();
+        let event = event("sensor.late", json!("1"), "2026-10-11T16:10:01Z");
+        let row = StateRow::from_new_state(
+            &event["event"]["data"]["new_state"],
+            None,
+            &Filters::default(),
+        )
+        .unwrap();
+        assert!(client.insert(&[row]).await.is_err(), "accepted {body:?}");
+        let requests = server.received_requests().await.unwrap();
+        let parameters = requests[0]
+            .url
+            .query_pairs()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(parameters.get("wait_end_of_query").unwrap(), "1");
+        assert_eq!(parameters.get("wait_for_async_insert").unwrap(), "1");
+        assert_eq!(
+            parameters.get("input_format_skip_unknown_fields").unwrap(),
+            "0"
+        );
+    }
+}
+
+#[tokio::test]
+async fn truncated_response_is_not_acknowledged() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(connection.read(&mut request).await.unwrap() > 0);
+        connection
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial",
+            )
+            .await
+            .unwrap();
+    });
+    let config = test_config(
+        Url::parse("ws://localhost").unwrap(),
+        Url::parse(&format!("http://{address}")).unwrap(),
+    );
+    let client = ha_ch_ingestor::clickhouse::ClickHouse::new(&config.ch).unwrap();
+    let event = event("sensor.partial", json!("1"), "2026-10-11T16:10:01Z");
+    let row = ha_ch_ingestor::row::StateRow::from_new_state(
+        &event["event"]["data"]["new_state"],
+        None,
+        &Filters::default(),
+    )
+    .unwrap();
+    assert!(matches!(client.insert(&[row]).await, Err(Error::Http(_))));
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_stalled_websocket_upgrade() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut config = test_config(
+        Url::parse(&format!("ws://{address}")).unwrap(),
+        Url::parse("http://localhost").unwrap(),
+    );
+    config.dry_run = true;
+    let (notify, handle) = spawn_ingester(config);
+    let (_connection, _) = listener.accept().await.unwrap();
+    notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("shutdown hung during HTTP upgrade")
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_stalled_schema_bootstrap() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .mount(&server)
+        .await;
+    let mut config = test_config(
+        Url::parse("ws://localhost").unwrap(),
+        Url::parse(&server.uri()).unwrap(),
+    );
+    config.ch.request_timeout = Duration::from_secs(10);
+    let (notify, handle) = spawn_ingester(config);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    notify.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("shutdown hung during bootstrap")
+        .unwrap();
+    assert!(matches!(result, Err(Error::Shutdown)));
+}
+
+#[tokio::test]
+async fn one_shutdown_deadline_bounds_a_blocked_insert_and_full_queue() {
+    let server = clickhouse_mock().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("sensor.blocked"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let events = (0..10)
+        .map(|_| event("sensor.blocked", json!("1"), "2026-10-11T16:10:01Z"))
+        .collect();
+    let (ws_url, _done) = spawn_fake_ha(events, false).await;
+    let mut config = test_config(ws_url, Url::parse(&server.uri()).unwrap());
+    config.batch.size = 1;
+    config.batch.capacity = 1;
+    config.batch.drain_grace = Duration::from_millis(100);
+    config.ch.request_timeout = Duration::from_secs(10);
+    let (notify, handle) = spawn_ingester(config);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while insert_requests(&server.received_requests().await.unwrap()).is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    notify.notify_one();
+    let result = tokio::time::timeout(Duration::from_millis(600), handle)
+        .await
+        .expect("drain exceeded its deadline")
+        .unwrap();
+    assert!(matches!(result, Err(Error::DrainTimeout)), "got {result:?}");
+}
+
+#[tokio::test]
+async fn shutdown_deadline_is_shared_by_all_successful_batches() {
+    let server = clickhouse_mock().await;
+    Mock::given(method("POST"))
+        .and(body_string_contains("sensor.slow"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(70)))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let events = (0..10)
+        .map(|_| event("sensor.slow", json!("1"), "2026-10-11T16:10:01Z"))
+        .collect();
+    let (ws_url, _done) = spawn_fake_ha(events, false).await;
+    let mut config = test_config(ws_url, Url::parse(&server.uri()).unwrap());
+    config.batch.size = 1;
+    config.batch.drain_grace = Duration::from_millis(120);
+    let (notify, handle) = spawn_ingester(config);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while insert_requests(&server.received_requests().await.unwrap()).is_empty() {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    notify.notify_one();
+    let result = tokio::time::timeout(Duration::from_millis(500), handle)
+        .await
+        .expect("each batch restarted the shutdown deadline")
+        .unwrap();
+    assert!(matches!(result, Err(Error::DrainTimeout)), "got {result:?}");
 }

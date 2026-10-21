@@ -8,12 +8,11 @@
 use std::collections::HashMap;
 
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::backoff::Backoff;
 use crate::config::ClickHouseConfig;
 use crate::error::{Error, Result};
-use crate::row::StateRow;
 
 /// Columns this build expects. A table created by the old Python ingester lacks
 /// `time_fired`; ClickHouse silently ignores unknown input fields, so without
@@ -53,9 +52,11 @@ impl ClickHouse {
             .no_proxy()
             .user_agent(concat!("ha-ch-ingestor/", env!("CARGO_PKG_VERSION")))
             .build()?;
+        let mut base = config.url.clone();
+        base.query_pairs_mut().append_pair("wait_end_of_query", "1");
         Ok(Self {
             client,
-            base: config.url.clone(),
+            base,
             user: config.user.clone(),
             password: config.password.clone(),
             database: config.database.clone(),
@@ -116,7 +117,7 @@ impl ClickHouse {
     pub async fn verify_schema(&self) -> Result<()> {
         let sql = format!(
             "SELECT name, type FROM system.columns WHERE database = '{}' AND table = '{}' \
-             FORMAT TabSeparated",
+             FORMAT TabSeparatedRaw",
             escape_literal(&self.database),
             escape_literal(&self.table)
         );
@@ -141,14 +142,27 @@ impl ClickHouse {
                 self.database, self.table
             )));
         }
-        if let Some(kind) = columns.get("last_updated")
-            && !kind.contains("DateTime64(6")
-        {
-            warn!(
-                column = "last_updated",
-                data_type = %kind,
-                "existing table has lower timestamp precision; microseconds will be truncated"
-            );
+        for (name, kind) in &columns {
+            let compatible = match *name {
+                "entity_id" | "state" => matches!(*kind, "String" | "LowCardinality(String)"),
+                "attributes" => *kind == "String",
+                "state_float" => *kind == "Nullable(Float64)",
+                "last_changed" | "last_updated" | "time_fired" | "ingested_at" => {
+                    matches!(
+                        *kind,
+                        "DateTime64(6, 'UTC')"
+                            | "DateTime64(7, 'UTC')"
+                            | "DateTime64(8, 'UTC')"
+                            | "DateTime64(9, 'UTC')"
+                    )
+                }
+                _ => true,
+            };
+            if !compatible {
+                return Err(Error::Schema(format!(
+                    "incompatible type {kind} for column {name}; timestamps require DateTime64(6..9, 'UTC'); see README.md"
+                )));
+            }
         }
         Ok(())
     }
@@ -187,7 +201,7 @@ impl ClickHouse {
     }
 
     /// Insert a batch and return the number of payload bytes sent.
-    pub async fn insert(&self, rows: &[StateRow]) -> Result<usize> {
+    pub async fn insert(&self, rows: &[impl serde::Serialize]) -> Result<usize> {
         if rows.is_empty() {
             return Ok(0);
         }
@@ -200,14 +214,17 @@ impl ClickHouse {
         let bytes = body.len();
 
         let mut url = self.base.clone();
-        url.query_pairs_mut().append_pair(
-            "query",
-            &format!(
-                "INSERT INTO {}.{} FORMAT JSONEachRow",
-                quote_ident(&self.database),
-                quote_ident(&self.table)
-            ),
-        );
+        url.query_pairs_mut()
+            .append_pair("wait_for_async_insert", "1")
+            .append_pair("input_format_skip_unknown_fields", "0")
+            .append_pair(
+                "query",
+                &format!(
+                    "INSERT INTO {}.{} FORMAT JSONEachRow",
+                    quote_ident(&self.database),
+                    quote_ident(&self.table)
+                ),
+            );
 
         let response = self
             .client
@@ -245,13 +262,7 @@ impl ClickHouse {
             .body(sql.to_owned())
             .send()
             .await?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body: String = body.chars().take(512).collect();
-            return Err(Error::ClickHouse { status, body });
-        }
-        Ok(response.text().await?)
+        read_response(response).await
     }
 
     fn schema_ddl(&self) -> String {
@@ -281,13 +292,38 @@ ORDER BY (entity_id, last_updated)",
 }
 
 async fn check_response(response: reqwest::Response) -> Result<()> {
-    let status = response.status();
-    if status.is_success() {
-        return Ok(());
+    let body = read_response(response).await?;
+    if !body.trim().is_empty() {
+        return Err(Error::ClickHouse {
+            status: reqwest::StatusCode::BAD_GATEWAY,
+            body: body.chars().take(512).collect(),
+        });
     }
-    let body = response.text().await.unwrap_or_default();
-    let body: String = body.chars().take(512).collect();
-    Err(Error::ClickHouse { status, body })
+    Ok(())
+}
+
+async fn read_response(response: reqwest::Response) -> Result<String> {
+    let status = response.status();
+    let exception = response
+        .headers()
+        .contains_key("X-ClickHouse-Exception-Code");
+    // Headers can precede a late error; never acknowledge a batch before EOF.
+    let body = response.text().await?;
+    if !status.is_success()
+        || exception
+        || body.trim_start().starts_with("Code:")
+        || body.contains("__exception__")
+    {
+        return Err(Error::ClickHouse {
+            status: if status.is_success() {
+                reqwest::StatusCode::INTERNAL_SERVER_ERROR
+            } else {
+                status
+            },
+            body: body.chars().take(512).collect(),
+        });
+    }
+    Ok(body)
 }
 
 /// Quote a validated SQL identifier. Backticks inside the name are doubled so

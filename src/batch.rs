@@ -11,8 +11,8 @@ use tokio::time::MissedTickBehavior;
 use crate::backoff::Backoff;
 use crate::clickhouse::ClickHouse;
 use crate::config::BatchConfig;
-use crate::error::Result;
-use crate::row::StateRow;
+use crate::error::{Error, Result};
+use crate::queue::QueuedRow;
 use crate::stats::Stats;
 
 /// Consume rows from the channel and insert them in batches.
@@ -22,14 +22,45 @@ use crate::stats::Stats;
 /// shutdown retries stop after `drain_grace`.
 pub async fn flush_loop(
     clickhouse: ClickHouse,
-    mut receiver: mpsc::Receiver<StateRow>,
+    receiver: mpsc::Receiver<QueuedRow>,
+    config: BatchConfig,
+    shutdown: watch::Receiver<bool>,
+    stats: Arc<Stats>,
+    dry_run: bool,
+) -> Result<()> {
+    let grace = config.drain_grace;
+    let mut stop = shutdown.clone();
+    let work = flush_batches(
+        clickhouse,
+        receiver,
+        config,
+        shutdown,
+        Arc::clone(&stats),
+        dry_run,
+    );
+    tokio::pin!(work);
+    tokio::select! {
+        result = &mut work => result,
+        _ = async { let _ = stop.wait_for(|requested| *requested).await; } => {
+            tokio::time::timeout(grace, &mut work).await.unwrap_or_else(|_| {
+                let snapshot = stats.snapshot();
+                tracing::error!(pending_rows = snapshot.rows.saturating_sub(snapshot.inserted), "shutdown deadline reached; pending rows will be lost");
+                Err(Error::DrainTimeout)
+            })
+        }
+    }
+}
+
+async fn flush_batches(
+    clickhouse: ClickHouse,
+    mut receiver: mpsc::Receiver<QueuedRow>,
     config: BatchConfig,
     mut shutdown: watch::Receiver<bool>,
     stats: Arc<Stats>,
     dry_run: bool,
 ) -> Result<()> {
     // Do not reserve gigabytes for a typo like BATCH_SIZE=100000000.
-    let mut buffer: Vec<StateRow> = Vec::with_capacity(config.size.min(4096));
+    let mut buffer: Vec<QueuedRow> = Vec::with_capacity(config.size.min(4096));
     let mut ticker = tokio::time::interval(config.interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     ticker.tick().await; // discard the immediately-ready first tick
@@ -45,14 +76,14 @@ pub async fn flush_loop(
                 Some(row) => {
                     buffer.push(row);
                     if buffer.len() >= config.size {
-                        flush(&clickhouse, &mut buffer, &config, &stats, dry_run, &mut shutdown).await?;
+                        flush(&clickhouse, &mut buffer, &config, &stats, dry_run).await?;
                     }
                 }
                 None => break,
             },
             _ = ticker.tick() => {
                 if !buffer.is_empty() {
-                    flush(&clickhouse, &mut buffer, &config, &stats, dry_run, &mut shutdown).await?;
+                    flush(&clickhouse, &mut buffer, &config, &stats, dry_run).await?;
                 }
             }
         }
@@ -63,38 +94,21 @@ pub async fn flush_loop(
     while let Some(row) = receiver.recv().await {
         buffer.push(row);
         if buffer.len() >= config.size {
-            flush(
-                &clickhouse,
-                &mut buffer,
-                &config,
-                &stats,
-                dry_run,
-                &mut shutdown,
-            )
-            .await?;
+            flush(&clickhouse, &mut buffer, &config, &stats, dry_run).await?;
         }
     }
 
-    flush(
-        &clickhouse,
-        &mut buffer,
-        &config,
-        &stats,
-        dry_run,
-        &mut shutdown,
-    )
-    .await?;
+    flush(&clickhouse, &mut buffer, &config, &stats, dry_run).await?;
     tracing::info!("flush loop stopped");
     Ok(())
 }
 
 async fn flush(
     clickhouse: &ClickHouse,
-    buffer: &mut Vec<StateRow>,
+    buffer: &mut Vec<QueuedRow>,
     config: &BatchConfig,
     stats: &Stats,
     dry_run: bool,
-    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     if buffer.is_empty() {
         return Ok(());
@@ -111,7 +125,6 @@ async fn flush(
 
     let started = Instant::now();
     let mut backoff = Backoff::new(config.backoff);
-    let mut deadline: Option<Instant> = None;
 
     loop {
         match clickhouse.insert(buffer).await {
@@ -138,39 +151,20 @@ async fn flush(
                     );
                     return Err(error);
                 }
-                if deadline.is_none() && *shutdown.borrow() {
-                    deadline = Some(Instant::now() + config.drain_grace);
-                }
                 let delay = backoff.next_delay();
-                if let Some(deadline) = deadline {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        tracing::error!(
-                            rows,
-                            error = %error,
-                            "dropping batch: clickhouse is still unavailable at the shutdown deadline"
-                        );
-                        return Err(error);
-                    }
-                    tokio::time::sleep(delay.min(deadline - now)).await;
-                } else {
-                    tracing::warn!(
-                        rows,
-                        error = %error,
-                        retry_in_ms = delay.as_millis() as u64,
-                        "clickhouse insert failed; retrying"
-                    );
-                    tokio::select! {
-                        () = tokio::time::sleep(delay) => {}
-                        _ = shutdown.changed() => {}
-                    }
-                }
+                tracing::warn!(
+                    rows,
+                    error = %error,
+                    retry_in_ms = delay.as_millis() as u64,
+                    "clickhouse insert failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
             }
         }
     }
 }
 
-fn write_ndjson(rows: &[StateRow]) -> Result<()> {
+fn write_ndjson(rows: &[impl serde::Serialize]) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for row in rows {
@@ -183,7 +177,7 @@ fn write_ndjson(rows: &[StateRow]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::row::StateRow;
 
     #[test]
     fn dry_run_rows_are_ndjson() {
